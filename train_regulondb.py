@@ -3,7 +3,7 @@ Training script for BactaGenome with real RegulonDB data
 """
 
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = '5'  # Set visible devices to GPU 0
+#os.environ["CUDA_VISIBLE_DEVICES"] = '5'  # Set visible devices to GPU 0
 import platform
 import argparse
 import yaml
@@ -48,7 +48,7 @@ def setup_logging():
 def parse_args():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(description="Train BactaGenome with RegulonDB data")
-    parser.add_argument("--config", type=str, default="configs/training/phase1_regulondb_reduced.yaml",
+    parser.add_argument("--config", type=str, default="configs/training/phase1_regulondb.yaml",
                         help="Path to training configuration file")
     parser.add_argument("--regulondb-path", type=str, 
                         default="./data/raw/RegulonDB",
