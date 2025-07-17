@@ -239,14 +239,20 @@ def main():
     
     loss_function = RegulonDBLossFunction(loss_weights=loss_weights)
     
-    # Setup accelerator
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-    accelerator = Accelerator(
-        gradient_accumulation_steps=config['training'].get('gradient_accumulation_steps', 1),
-        mixed_precision=config['training'].get('mixed_precision', 'no'),
-        log_with="wandb" if config['training'].get('use_wandb', False) else None,
-        kwargs_handlers=[ddp_kwargs]
-    )
+    # Setup accelerator (optional - can run without accelerate launch)
+    try:
+        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+        accelerator = Accelerator(
+            gradient_accumulation_steps=config['training'].get('gradient_accumulation_steps', 1),
+            mixed_precision=config['training'].get('mixed_precision', 'no'),
+            log_with="wandb" if config['training'].get('use_wandb', False) else None,
+            kwargs_handlers=[ddp_kwargs]
+        )
+        logger.info("Using Accelerator for distributed training")
+    except Exception as e:
+        logger.warning(f"Accelerator initialization failed: {e}")
+        logger.info("Running without Accelerator (single GPU mode)")
+        accelerator = None
     
     # Create learning rate scheduler with warmup (AlphaGenome style)
     def create_lr_scheduler(optimizer, config):
@@ -268,25 +274,34 @@ def main():
     # Create scheduler
     scheduler = create_lr_scheduler(optimizer, config) if config['training'].get('scheduler') == 'cosine_with_warmup' else None
     
-    # Prepare for distributed training
-    model, optimizer, train_loader, val_loader = accelerator.prepare(
-        model, optimizer, train_loader, val_loader
-    )
-    
-    # Prepare scheduler after accelerator.prepare
-    if scheduler is not None:
-        scheduler = accelerator.prepare(scheduler)
+    # Prepare for distributed training (if accelerator available)
+    if accelerator is not None:
+        model, optimizer, train_loader, val_loader = accelerator.prepare(
+            model, optimizer, train_loader, val_loader
+        )
+        
+        # Prepare scheduler after accelerator.prepare
+        if scheduler is not None:
+            scheduler = accelerator.prepare(scheduler)
+        
+        device = accelerator.device
+    else:
+        # Manual device setup
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        model = model.to(device)
+        logger.info(f"Using device: {device}")
     
     # Create trainer
     trainer = BactaGenomeTrainer(
         model=model,
         optimizer=optimizer,
         loss_function=loss_function,
-        device=accelerator.device,
+        device=device,
         accelerator=accelerator,
         log_interval=config['training'].get('log_interval', 10),
         max_grad_norm=config['training'].get('max_grad_norm'),
-        scheduler=scheduler
+        scheduler=scheduler,
+        gradient_accumulation_steps=config['training'].get('gradient_accumulation_steps', 1)
     )
     
     # Resume from checkpoint if provided

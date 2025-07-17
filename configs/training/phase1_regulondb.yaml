@@ -18,10 +18,10 @@ model:
 
 # Training hyperparameters - AlphaGenome-aligned parameters
 training:
-  epochs: 5                                        # More epochs for real data
+  epochs: 681                                        # More epochs for real data
   # AlphaGenome uses batch_size: 64, but smaller here due to memory constraints
-  batch_size: 1                                    # Smaller batch due to large sequences
-  learning_rate: 0.004                            # AlphaGenome peak learning rate (was 1e-4)
+  batch_size: 2                                    # Smaller batch due to large sequences
+  learning_rate: 0.0005                            # AlphaGenome peak learning rate (was 1e-4)
   # AlphaGenome uses weight_decay: 0.4, but we use smaller due to limited data
   weight_decay: 0.1                               # L2 regularization (increased from 0.01)
   gradient_accumulation_steps: 4                   # Effective batch size = 4 (AlphaGenome: 64)
@@ -44,9 +44,9 @@ training:
   
   # Optimization - AlphaGenome style
   # AlphaGenome uses 5,000 warmup steps out of 15,000 total
-  warmup_steps: 1000                               # Warmup schedule (increased from 500)
+  warmup_steps: 5000                               # Warmup schedule (increased from 500)
   scheduler: "cosine_with_warmup"                  # Learning rate schedule with warmup
-  total_steps: 3000                                # Total training steps (for LR schedule)
+  total_steps: 15000                                # Total training steps (for LR schedule)
   
   # Hardware and performance
   num_workers: 2                                   # Data loading workers

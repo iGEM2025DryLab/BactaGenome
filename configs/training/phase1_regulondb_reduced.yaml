@@ -21,7 +21,7 @@ training:
   epochs: 32                                        # More epochs for real data
   # AlphaGenome uses batch_size: 64, but smaller here due to memory constraints
   batch_size: 2                                    # Smaller batch due to large sequences
-  learning_rate: 0.004                            # AlphaGenome peak learning rate (was 1e-4)
+  learning_rate: 0.0005                           # Reduced for MSE loss (AlphaGenome 0.004 for Poisson loss)
   # AlphaGenome uses weight_decay: 0.4, but we use smaller due to limited data
   weight_decay: 0.1                               # L2 regularization (increased from 0.01)
   gradient_accumulation_steps: 4                   # Effective batch size = 4 (AlphaGenome: 64)

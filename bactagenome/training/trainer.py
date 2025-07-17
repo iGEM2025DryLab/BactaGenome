@@ -29,6 +29,7 @@ class BactaGenomeTrainer:
         use_alphgenome_loss: bool = True,
         max_grad_norm: Optional[float] = None,
         scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
+        gradient_accumulation_steps: int = 1,
     ):
         self.model = model
         self.optimizer = optimizer
@@ -45,6 +46,7 @@ class BactaGenomeTrainer:
         self.log_interval = log_interval
         self.max_grad_norm = max_grad_norm
         self.scheduler = scheduler
+        self.gradient_accumulation_steps = gradient_accumulation_steps
         
         # Setup logging
         self.logger = logging.getLogger(__name__)
@@ -80,65 +82,88 @@ class BactaGenomeTrainer:
         
         pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
         
+        # Manual gradient accumulation setup (for non-accelerator usage)
+        gradient_accumulation_steps = getattr(self.accelerator, 'gradient_accumulation_steps', 1) if self.accelerator else 1
+        
         for batch_idx, batch in enumerate(pbar):
-            # Move batch to device
-            batch = self._move_batch_to_device(batch)
-            
-            # Extract inputs
-            dna = batch['dna']
-            organism_index = batch['organism_index']
-            
-            # Forward pass
-            self.optimizer.zero_grad()
-            
-            batch_loss = 0.0
-            batch_modality_losses = {}
-            
-            # Process each organism in the batch
-            for org_idx in organism_index.unique():
-                mask = organism_index == org_idx
-                org_name = self.index_to_organism[org_idx.item()]
-                
-                # Get predictions for this organism
-                org_dna = dna[mask]
-                org_organism_index = organism_index[mask]
-                
-                predictions = self.model(org_dna, org_organism_index)
-                
-                # Extract targets for this organism
-                targets = self._extract_targets(batch, mask, org_name)
-                
-                # Compute loss
-                if org_name in predictions:
-                    loss, individual_losses = self.loss_function(
-                        predictions[org_name], targets, org_name
-                    )
-                    batch_loss += loss
-                    
-                    # Accumulate individual losses
-                    for modality, loss_val in individual_losses.items():
-                        if modality not in batch_modality_losses:
-                            batch_modality_losses[modality] = 0.0
-                        batch_modality_losses[modality] += loss_val
-            
-            # Backward pass
+            # Use accelerator.accumulate if available, otherwise manual accumulation
             if self.accelerator is not None:
-                self.accelerator.backward(batch_loss)
+                context_manager = self.accelerator.accumulate(self.model)
             else:
-                batch_loss.backward()
+                # Manual gradient accumulation context (no-op)
+                import contextlib
+                context_manager = contextlib.nullcontext()
             
-            # Gradient clipping for stability
-            if self.max_grad_norm is not None:
-                if self.accelerator is not None:
-                    self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                else:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+            with context_manager:
+                # Move batch to device
+                batch = self._move_batch_to_device(batch)
                 
-            self.optimizer.step()
-            
-            # Update learning rate scheduler
-            if self.scheduler is not None:
-                self.scheduler.step()
+                # Extract inputs
+                dna = batch['dna']
+                organism_index = batch['organism_index']
+                
+                # Forward pass
+                batch_loss = 0.0
+                batch_modality_losses = {}
+                
+                # Process each organism in the batch
+                for org_idx in organism_index.unique():
+                    mask = organism_index == org_idx
+                    org_name = self.index_to_organism[org_idx.item()]
+                    
+                    # Get predictions for this organism
+                    org_dna = dna[mask]
+                    org_organism_index = organism_index[mask]
+                    
+                    predictions = self.model(org_dna, org_organism_index)
+                    
+                    # Extract targets for this organism
+                    targets = self._extract_targets(batch, mask, org_name)
+                    
+                    # Compute loss
+                    if org_name in predictions:
+                        loss, individual_losses = self.loss_function(
+                            predictions[org_name], targets, org_name
+                        )
+                        batch_loss += loss
+                        
+                        # Accumulate individual losses
+                        for modality, loss_val in individual_losses.items():
+                            if modality not in batch_modality_losses:
+                                batch_modality_losses[modality] = 0.0
+                            batch_modality_losses[modality] += loss_val
+                
+                # Scale loss for gradient accumulation (manual implementation)
+                if self.accelerator is None:
+                    batch_loss = batch_loss / gradient_accumulation_steps
+                
+                # Backward pass
+                if self.accelerator is not None:
+                    self.accelerator.backward(batch_loss)
+                else:
+                    batch_loss.backward()
+                
+                # Gradient clipping and optimizer step
+                should_step = False
+                if self.accelerator is not None:
+                    should_step = self.accelerator.sync_gradients
+                else:
+                    # Manual accumulation: step every N batches
+                    should_step = (batch_idx + 1) % gradient_accumulation_steps == 0
+                
+                if should_step:
+                    if self.max_grad_norm is not None:
+                        if self.accelerator is not None:
+                            self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                        else:
+                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+                    
+                    # Update learning rate scheduler (only when step is taken)
+                    if self.scheduler is not None:
+                        self.scheduler.step()
             
             # Update metrics
             total_loss += batch_loss.item()
