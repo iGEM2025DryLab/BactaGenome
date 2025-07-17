@@ -59,40 +59,46 @@ def multinomial_poisson_loss(predictions: torch.Tensor, targets: torch.Tensor,
     """
     AlphaGenome-style loss combining multinomial and Poisson components
     
-    Divides sequence into exactly 8 equal segments as per AlphaGenome paper.
-    Combines Poisson NLL (segment totals) + Multinomial NLL (within-segment distribution).
+    IMPORTANT: Targets should already be scaled by target_scaling() before calling this function.
+    Predictions are already scaled by the head's softplus activation.
+    
+    Args:
+        predictions: Model predictions [batch, seq_len, num_tracks] (already scaled by head)
+        targets: Target values [batch, seq_len, num_tracks] (should be pre-scaled)
+        multinomial_resolution: Segment size within each of the 8 segments
+        multinomial_weight: Weight for multinomial component (default 5.0)
     """
-    predictions = predictions_scaling(predictions, nonzero_mean(predictions), apply_squashing=False)
-    targets = targets_scaling(targets, nonzero_mean(targets), apply_squashing=False)
+    # No additional scaling - both predictions and targets should be properly scaled already
 
 
     batch_size, seq_len, num_tracks = predictions.shape
     
-    # AlphaGenome uses exactly 8 segments, regardless of resolution
+    # AlphaGenome: divide into 8 segments, each with multinomial_resolution bins
     num_segments = 8
-    segment_size = seq_len // num_segments
     
-    # If sequence is too small for 8 segments, fall back to MSE
-    if segment_size < 1:
+    # Calculate segment size based on multinomial_resolution
+    # For AlphaGenome: 1bp has 2^17 bins per segment, 128bp has 1024 bins per segment
+    if seq_len < num_segments * multinomial_resolution:
+        # If sequence too short, fall back to MSE
         mse_loss = torch.nn.MSELoss()
         return mse_loss(predictions, targets)
     
-    # Truncate to make evenly divisible by 8 segments
-    effective_length = num_segments * segment_size
+    # Truncate to make evenly divisible: 8 segments × multinomial_resolution
+    effective_length = num_segments * multinomial_resolution
     pred_truncated = predictions[:, :effective_length]
     target_truncated = targets[:, :effective_length]
     
-    # Reshape to [batch, 8_segments, segment_size, num_tracks]
-    pred_segments = pred_truncated.reshape(batch_size, num_segments, segment_size, num_tracks)
-    target_segments = target_truncated.reshape(batch_size, num_segments, segment_size, num_tracks)
+    # Reshape to [batch, 8_segments, multinomial_resolution, num_tracks]
+    pred_segments = pred_truncated.reshape(batch_size, num_segments, multinomial_resolution, num_tracks)
+    target_segments = target_truncated.reshape(batch_size, num_segments, multinomial_resolution, num_tracks)
     
     # Sum over positions within each segment
     sum_pred = torch.sum(pred_segments, dim=2, keepdim=True)  # [batch, 8, 1, num_tracks]
     sum_target = torch.sum(target_segments, dim=2, keepdim=True)
     
-    # Poisson NLL on segment totals (scaled by segment size as in AlphaGenome)
+    # Poisson NLL on segment totals (scaled by multinomial_resolution as in AlphaGenome)
     poisson_loss = torch.sum(sum_pred - sum_target * torch.log(sum_pred + 1e-7))
-    poisson_loss = poisson_loss / segment_size  # Scale by segment size
+    poisson_loss = poisson_loss / multinomial_resolution  # Scale by resolution
     
     # Multinomial NLL on within-segment distributions
     multinomial_prob = pred_segments / (sum_pred + 1e-7)
@@ -120,7 +126,8 @@ class GeneExpressionHead(nn.Module):
         self.linear = Linear(dim_1bp, num_tracks)
         
         # Learnable per-track scaling parameters (AlphaGenome style)
-        self.scale = Parameter(torch.zeros(num_tracks))
+        # Initialize to small positive value to avoid log(0) issues
+        self.scale = Parameter(torch.full((num_tracks,), -2.0))  # softplus(-2) ≈ 0.127
         
         # Track means for scaling (will be set during training)
         self.register_buffer('track_means', torch.ones(num_tracks))
@@ -161,7 +168,8 @@ class GeneDensityHead(nn.Module):
         self.linear = Linear(dim_128bp, num_tracks)
         
         # Learnable per-track scaling parameters (AlphaGenome style)
-        self.scale = Parameter(torch.zeros(num_tracks))
+        # Initialize to small positive value to avoid log(0) issues
+        self.scale = Parameter(torch.full((num_tracks,), -2.0))  # softplus(-2) ≈ 0.127
         
         # Track means for scaling
         self.register_buffer('track_means', torch.ones(num_tracks))
@@ -479,6 +487,28 @@ class RegulonDBHeadManager(nn.ModuleDict):
         }
         super().__init__(heads_dict)
         self.organism_name = organism_name
+        
+        # Initialize track means with RegulonDB data statistics
+        self._initialize_track_means()
+    
+    def _initialize_track_means(self):
+        """Initialize track means based on RegulonDB data analysis"""
+        # Based on analyze_targets.py results:
+        # Gene expression: mean=4.35, std=2.09, range=[-0.85, 9.79]
+        # Gene density: mean=1.03, std=0.35, range=[0, 4] 
+        # Operon membership: mean=0.88, std=0.32, range=[0, 1]
+        
+        # For AlphaGenome-style scaling, we need the mean of non-zero values
+        # Gene expression: use mean of non-zero values (87.17% are non-zero)
+        gene_expr_nonzero_mean = 4.35 / 0.8717  # Adjust for non-zero proportion
+        
+        # Gene density: use mean of non-zero values (95.41% are non-zero)
+        gene_density_nonzero_mean = 1.03 / 0.9541
+        
+        # Initialize track means in heads
+        self['gene_expression'].set_track_means(torch.tensor([gene_expr_nonzero_mean]))
+        self['gene_density'].set_track_means(torch.tensor([gene_density_nonzero_mean]))
+        # Operon membership doesn't need track means (binary classification)
     
     @property
     def heads(self):
@@ -563,25 +593,27 @@ class RegulonDBLossFunction(nn.Module):
         individual_losses = {}
         total_loss = 0.0
         
-        # Gene expression loss - use AlphaGenome-style for count-like data
+        # Gene expression loss - use MSE for normalized expression data
         if 'gene_expression' in predictions and 'gene_expression' in targets:
             pred = predictions['gene_expression']
             target = targets['gene_expression']
             
             # Ensure compatible shapes
             if pred.shape != target.shape:
-                logging.error('Prediction and target tensors for "gene expression" have different shapes')
+                logging.warning('Prediction and target tensors for "gene expression" have different shapes')
                 min_len = min(pred.shape[1], target.shape[1])
                 pred = pred[:, :min_len]
                 target = target[:, :min_len]
             
-            if self.use_alphgenome_loss and len(pred.shape) == 3 and pred.shape[1] >= 128:
-                # Use multinomial+Poisson loss for sequence-level predictions
-                loss = multinomial_poisson_loss(pred, target, multinomial_resolution=128)
-            else:
-                # Fallback to MSE for simple cases
-                logging.error('Fallback to MSE loss for "gene expression"')
-                loss = self.mse_loss(pred, target)
+            # Use MSE loss for normalized expression data
+            # AlphaGenome multinomial+Poisson loss is designed for raw count data,
+            # but RegulonDB expression data is pre-normalized (log-transformed, z-scored)
+            
+            # Debug: Check prediction and target ranges
+            if logging.getLogger().isEnabledFor(logging.DEBUG):
+                logging.debug(f"Gene expression - Pred range: [{pred.min():.3f}, {pred.max():.3f}], Target range: [{target.min():.3f}, {target.max():.3f}]")
+            
+            loss = self.mse_loss(pred, target)
             
             individual_losses['gene_expression'] = loss.item()
             total_loss += self.loss_weights['gene_expression'] * loss
@@ -593,19 +625,27 @@ class RegulonDBLossFunction(nn.Module):
             
             # Ensure compatible shapes
             if pred.shape != target.shape:
-                logging.error('Prediction and target tensors for "gene density" have different shapes')
+                logging.warning('Prediction and target tensors for "gene density" have different shapes')
                 min_len = min(pred.shape[1], target.shape[1])
                 pred = pred[:, :min_len]
                 target = target[:, :min_len]
             
-            if self.use_alphgenome_loss and len(pred.shape) == 3 and pred.shape[1] >= 64:
-                # Use multinomial+Poisson loss for count predictions
-                resolution = min(64, pred.shape[1] // 8)  # Adaptive resolution
-                loss = multinomial_poisson_loss(pred, target, multinomial_resolution=resolution)
-            else:
-                # Fallback to MSE
-                logging.error('Fallback to MSE loss for "gene density"')
-                loss = self.mse_loss(pred, target)
+            # Use MSE loss for gene density as well (safer for initial training)
+            # Gene density has small integer values (0-4), but MSE is more stable
+            # than multinomial+Poisson loss during early training
+            
+            # Debug: Check prediction and target ranges
+            if logging.getLogger().isEnabledFor(logging.DEBUG):
+                logging.debug(f"Gene density - Pred range: [{pred.min():.3f}, {pred.max():.3f}], Target range: [{target.min():.3f}, {target.max():.3f}]")
+            
+            loss = self.mse_loss(pred, target)
+            
+            # TODO: Consider switching to multinomial+Poisson loss after stable training
+            # if self.use_alphgenome_loss and len(pred.shape) == 3 and pred.shape[1] >= 64:
+            #     track_means = torch.tensor([1.08]).to(target.device)
+            #     scaled_targets = targets_scaling(target, track_means, apply_squashing=False)
+            #     resolution = min(pred.shape[1] // 8, 128)
+            #     loss = multinomial_poisson_loss(pred, scaled_targets, multinomial_resolution=resolution)
             
             individual_losses['gene_density'] = loss.item()
             total_loss += self.loss_weights['gene_density'] * loss
@@ -617,11 +657,12 @@ class RegulonDBLossFunction(nn.Module):
             
             # Ensure compatible shapes
             if pred.shape != target.shape:
-                logging.error('Prediction and target tensors for "operon membership" have different shapes')
+                logging.warning('Prediction and target tensors for "operon membership" have different shapes')
                 min_len = min(pred.shape[1], target.shape[1])
                 pred = pred[:, :min_len]
                 target = target[:, :min_len]
             
+            # Use BCE loss for binary classification
             loss = self.bce_loss(pred, target)
             individual_losses['operon_membership'] = loss.item()
             total_loss += self.loss_weights['operon_membership'] * loss
