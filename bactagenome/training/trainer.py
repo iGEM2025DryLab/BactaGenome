@@ -152,10 +152,25 @@ class BactaGenomeTrainer:
                 
             # Update progress bar
             if batch_idx % self.log_interval == 0:
-                pbar.set_postfix({
+                postfix = {
                     'loss': f"{batch_loss.item():.4f}",
                     'avg_loss': f"{total_loss / (batch_idx + 1):.4f}"
-                })
+                }
+                
+                # Add current learning rate
+                if self.scheduler is not None:
+                    current_lr = self.scheduler.get_last_lr()[0]
+                    postfix['lr'] = f"{current_lr:.2e}"
+                else:
+                    current_lr = self.optimizer.param_groups[0]['lr']
+                    postfix['lr'] = f"{current_lr:.2e}"
+                
+                # Add individual modality losses (running averages)
+                for modality, loss_val in batch_modality_losses.items():
+                    avg_modality_loss = modality_losses.get(modality, 0.0) / (batch_idx + 1)
+                    postfix[f'{modality}'] = f"{avg_modality_loss:.4f}"
+                
+                pbar.set_postfix(postfix)
         
         # Calculate average losses
         avg_loss = total_loss / len(dataloader)
