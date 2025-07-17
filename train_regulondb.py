@@ -230,11 +230,11 @@ def main():
         eps=1e-8             # AlphaGenome defaults
     )
     
-    # Create realistic loss function with proper weights
+    # Create loss function with balanced weights for AlphaGenome-style losses
     loss_weights = config['training'].get('loss_weights', {
-        'gene_expression': 1.0,
-        'gene_density': 1.0,
-        'operon_membership': 1.0
+        'gene_expression': 1.0,    # Normal weight for AlphaGenome-style loss
+        'gene_density': 1.0,       # Normal weight for count data
+        'operon_membership': 1.0   # Normal weight for binary classification
     })
     
     loss_function = RegulonDBLossFunction(loss_weights=loss_weights)
