@@ -17,7 +17,8 @@ def tracks_scaled_predictions(embeddings: torch.Tensor, head: nn.Module, scale_p
     AlphaGenome-style track prediction with learnable scaling
     """
     x = head(embeddings)  # Linear projection
-    return F.softplus(x) * F.softplus(scale_param)
+    # return F.softplus(x) * F.softplus(scale_param)
+    return F.mish(x) * F.mish(scale_param)
 
 
 def nonzero_mean(tensor):
