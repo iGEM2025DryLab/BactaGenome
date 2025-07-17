@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torch.nn import Linear, Conv1d, Parameter
 from einops import repeat, reduce
 import math
+import logging
 
 
 def tracks_scaled_predictions(embeddings: torch.Tensor, head: nn.Module, scale_param: Parameter) -> torch.Tensor:
@@ -17,6 +18,14 @@ def tracks_scaled_predictions(embeddings: torch.Tensor, head: nn.Module, scale_p
     """
     x = head(embeddings)  # Linear projection
     return F.softplus(x) * F.softplus(scale_param)
+
+
+def nonzero_mean(tensor):
+    """Calculate mean of non-zero values"""
+    mask = tensor != 0
+    if mask.sum() == 0:  # All zeros
+        return torch.tensor(0.0)
+    return tensor[mask].mean()
 
 
 def targets_scaling(targets: torch.Tensor, track_means: torch.Tensor, apply_squashing: bool = False) -> torch.Tensor:
@@ -49,44 +58,48 @@ def multinomial_poisson_loss(predictions: torch.Tensor, targets: torch.Tensor,
                            multinomial_weight: float = 5.0) -> torch.Tensor:
     """
     AlphaGenome-style loss combining multinomial and Poisson components
+    
+    Divides sequence into exactly 8 equal segments as per AlphaGenome paper.
+    Combines Poisson NLL (segment totals) + Multinomial NLL (within-segment distribution).
     """
+    predictions = predictions_scaling(predictions, nonzero_mean(predictions), apply_squashing=False)
+    targets = targets_scaling(targets, nonzero_mean(targets), apply_squashing=False)
+
+
     batch_size, seq_len, num_tracks = predictions.shape
     
-    # Adjust resolution if sequence length is not divisible
-    if seq_len % multinomial_resolution != 0:
-        # Use adaptive resolution or fall back to simple segments
-        num_segments = max(1, seq_len // 64)  # At least 1 segment, up to seq_len//64
-        segment_size = seq_len // num_segments
-    else:
-        segment_size = multinomial_resolution
-        num_segments = seq_len // segment_size
+    # AlphaGenome uses exactly 8 segments, regardless of resolution
+    num_segments = 8
+    segment_size = seq_len // num_segments
     
-    # If sequence is too small, fall back to MSE loss
-    if num_segments < 2:
+    # If sequence is too small for 8 segments, fall back to MSE
+    if segment_size < 1:
         mse_loss = torch.nn.MSELoss()
         return mse_loss(predictions, targets)
     
-    # Reshape for segment-wise loss calculation
-    # Truncate to make evenly divisible
+    # Truncate to make evenly divisible by 8 segments
     effective_length = num_segments * segment_size
     pred_truncated = predictions[:, :effective_length]
     target_truncated = targets[:, :effective_length]
     
+    # Reshape to [batch, 8_segments, segment_size, num_tracks]
     pred_segments = pred_truncated.reshape(batch_size, num_segments, segment_size, num_tracks)
     target_segments = target_truncated.reshape(batch_size, num_segments, segment_size, num_tracks)
     
-    # Sum over segment positions
-    sum_pred = torch.sum(pred_segments, dim=2, keepdim=True)  # [batch, num_segments, 1, num_tracks]
+    # Sum over positions within each segment
+    sum_pred = torch.sum(pred_segments, dim=2, keepdim=True)  # [batch, 8, 1, num_tracks]
     sum_target = torch.sum(target_segments, dim=2, keepdim=True)
     
-    # Poisson loss on segment totals
+    # Poisson NLL on segment totals (scaled by segment size as in AlphaGenome)
     poisson_loss = torch.sum(sum_pred - sum_target * torch.log(sum_pred + 1e-7))
+    poisson_loss = poisson_loss / segment_size  # Scale by segment size
     
-    # Multinomial loss on within-segment distributions
+    # Multinomial NLL on within-segment distributions
     multinomial_prob = pred_segments / (sum_pred + 1e-7)
     positional_loss = torch.sum(-target_segments * torch.log(multinomial_prob + 1e-7))
     
-    return poisson_loss / segment_size + multinomial_weight * positional_loss
+    # Combine with multinomial weight (5.0 as in AlphaGenome)
+    return poisson_loss + multinomial_weight * positional_loss
 
 
 class GeneExpressionHead(nn.Module):
@@ -450,15 +463,15 @@ class SecretionSignalHead(nn.Module):
         return torch.sigmoid(signal_logits)  # Multi-label classification
 
 
-class RealisticBacterialHeadManager(nn.ModuleDict):
+class RegulonDBHeadManager(nn.ModuleDict):
     """
-    Head manager for realistic bacterial genomics targets
+    Head manager for RegulonDB-based bacterial genomics targets
     Uses achievable prediction tasks based on actual RegulonDB data analysis
     Compatible with existing BactaGenome model interface by inheriting from ModuleDict
     """
     
     def __init__(self, dim_1bp: int, dim_128bp: int, organism_name: str):
-        # Initialize with realistic heads
+        # Initialize with RegulonDB-based heads
         heads_dict = {
             'gene_expression': GeneExpressionHead(dim_1bp),
             'gene_density': GeneDensityHead(dim_128bp), 
@@ -513,9 +526,9 @@ class RealisticBacterialHeadManager(nn.ModuleDict):
         }
 
 
-class RealisticBacterialLossFunction(nn.Module):
+class RegulonDBLossFunction(nn.Module):
     """
-    Loss function for realistic bacterial genomics targets
+    Loss function for RegulonDB-based bacterial genomics targets
     Uses AlphaGenome-inspired loss functions for better training
     """
     
@@ -557,6 +570,7 @@ class RealisticBacterialLossFunction(nn.Module):
             
             # Ensure compatible shapes
             if pred.shape != target.shape:
+                logging.error('Prediction and target tensors for "gene expression" have different shapes')
                 min_len = min(pred.shape[1], target.shape[1])
                 pred = pred[:, :min_len]
                 target = target[:, :min_len]
@@ -566,6 +580,7 @@ class RealisticBacterialLossFunction(nn.Module):
                 loss = multinomial_poisson_loss(pred, target, multinomial_resolution=128)
             else:
                 # Fallback to MSE for simple cases
+                logging.error('Fallback to MSE loss for "gene expression"')
                 loss = self.mse_loss(pred, target)
             
             individual_losses['gene_expression'] = loss.item()
@@ -578,6 +593,7 @@ class RealisticBacterialLossFunction(nn.Module):
             
             # Ensure compatible shapes
             if pred.shape != target.shape:
+                logging.error('Prediction and target tensors for "gene density" have different shapes')
                 min_len = min(pred.shape[1], target.shape[1])
                 pred = pred[:, :min_len]
                 target = target[:, :min_len]
@@ -588,6 +604,7 @@ class RealisticBacterialLossFunction(nn.Module):
                 loss = multinomial_poisson_loss(pred, target, multinomial_resolution=resolution)
             else:
                 # Fallback to MSE
+                logging.error('Fallback to MSE loss for "gene density"')
                 loss = self.mse_loss(pred, target)
             
             individual_losses['gene_density'] = loss.item()
@@ -600,6 +617,7 @@ class RealisticBacterialLossFunction(nn.Module):
             
             # Ensure compatible shapes
             if pred.shape != target.shape:
+                logging.error('Prediction and target tensors for "operon membership" have different shapes')
                 min_len = min(pred.shape[1], target.shape[1])
                 pred = pred[:, :min_len]
                 target = target[:, :min_len]
@@ -611,9 +629,9 @@ class RealisticBacterialLossFunction(nn.Module):
         return total_loss, individual_losses
 
 
-def create_realistic_bacterial_heads(dim_1bp: int, dim_128bp: int, organism_name: str) -> RealisticBacterialHeadManager:
+def create_regulondb_bacterial_heads(dim_1bp: int, dim_128bp: int, organism_name: str) -> RegulonDBHeadManager:
     """
-    Factory function to create realistic bacterial heads
+    Factory function to create RegulonDB-based bacterial heads
     
     Args:
         dim_1bp: Dimension of 1bp embeddings
@@ -621,18 +639,18 @@ def create_realistic_bacterial_heads(dim_1bp: int, dim_128bp: int, organism_name
         organism_name: Name of organism
         
     Returns:
-        RealisticBacterialHeadManager instance
+        RegulonDBHeadManager instance
     """
-    return RealisticBacterialHeadManager(
+    return RegulonDBHeadManager(
         dim_1bp=dim_1bp,
         dim_128bp=dim_128bp,
         organism_name=organism_name
     )
 
 
-def integrate_realistic_heads_with_model(model, organism_name: str):
+def integrate_regulondb_heads_with_model(model, organism_name: str):
     """
-    Replace model heads with realistic bacterial heads
+    Replace model heads with RegulonDB-based bacterial heads
     
     Args:
         model: BactaGenome model instance
@@ -660,9 +678,9 @@ def integrate_realistic_heads_with_model(model, organism_name: str):
             'head_forward_arg_maps': model.head_forward_arg_maps[organism_name] if hasattr(model, 'head_forward_arg_maps') else {}
         }
         
-        # Replace with realistic heads
-        realistic_head_manager = create_realistic_bacterial_heads(dim_1bp, dim_128bp, organism_name)
-        model.heads[organism_name] = realistic_head_manager
+        # Replace with RegulonDB-based heads
+        regulondb_head_manager = create_regulondb_bacterial_heads(dim_1bp, dim_128bp, organism_name)
+        model.heads[organism_name] = regulondb_head_manager
         
         # Update head configuration for new heads
         if hasattr(model, 'head_forward_arg_names'):
@@ -679,6 +697,6 @@ def integrate_realistic_heads_with_model(model, organism_name: str):
                 'operon_membership': {}
             }
         
-        print(f"Replaced {organism_name} heads with realistic bacterial heads (1bp={dim_1bp}, 128bp={dim_128bp})")
+        print(f"Replaced {organism_name} heads with RegulonDB-based bacterial heads (1bp={dim_1bp}, 128bp={dim_128bp})")
     else:
         print(f"Warning: No existing heads found for {organism_name}")

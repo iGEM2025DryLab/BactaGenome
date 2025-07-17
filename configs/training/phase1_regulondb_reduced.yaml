@@ -3,24 +3,24 @@
 
 # Model architecture - optimized for Phase 1
 model:
-  dims: [768, 896, 1024, 1152, 1280, 1408, 1536]  # U-Net channel dimensions
+  dims: [64, 80, 96, 112, 128, 144, 160]  # U-Net channel dimensions
   context_length: 98304                             # 100K bp sequences (AlphaGenome style)
   num_organisms: 1                                  # Phase 1: E. coli only
   
   # Transformer hyperparameters (must match TransformerTower.__init__)
   transformer_kwargs:
-    depth: 9                                        # AlphaGenome-like depth
-    heads: 8                                        # Attention heads
-    dim_head_qk: 128                               # Query/Key head dimension
-    dim_head_v: 192                                # Value head dimension
+    depth: 2                                        # AlphaGenome-like depth
+    heads: 2                                        # Attention heads
+    dim_head_qk: 64                               # Query/Key head dimension
+    dim_head_v: 96                                # Value head dimension
     dropout: 0.1                                   # Dropout rate
     max_positions: 8192                            # Max sequence positions
 
 # Training hyperparameters - AlphaGenome-aligned parameters
 training:
-  epochs: 5                                        # More epochs for real data
+  epochs: 32                                        # More epochs for real data
   # AlphaGenome uses batch_size: 64, but smaller here due to memory constraints
-  batch_size: 1                                    # Smaller batch due to large sequences
+  batch_size: 2                                    # Smaller batch due to large sequences
   learning_rate: 0.004                            # AlphaGenome peak learning rate (was 1e-4)
   # AlphaGenome uses weight_decay: 0.4, but we use smaller due to limited data
   weight_decay: 0.1                               # L2 regularization (increased from 0.01)
@@ -84,7 +84,7 @@ organisms:
   - "E_coli_K12"                                   # Phase 1: single organism
 
 # Phase indicator
-phase: 1
+phase: 0
 
 # RegulonDB specific settings
 regulondb:
