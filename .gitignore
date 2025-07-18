@@ -100,3 +100,5 @@ dmypy.json
 *.h5
 *.hdf5
 *.zarr
+
+inference_outputs/
