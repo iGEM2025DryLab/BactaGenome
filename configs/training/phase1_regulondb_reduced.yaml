@@ -21,10 +21,10 @@ training:
   epochs: 32                                        # More epochs for real data
   # AlphaGenome uses batch_size: 64, but smaller here due to memory constraints
   batch_size: 2                                    # Smaller batch due to large sequences
-  learning_rate: 0.0005                           # Reduced for MSE loss (AlphaGenome 0.004 for Poisson loss)
+  learning_rate: 0.001                           # Reduced for MSE loss (AlphaGenome 0.004 for Poisson loss)
   # AlphaGenome uses weight_decay: 0.4, but we use smaller due to limited data
   weight_decay: 0.1                               # L2 regularization (increased from 0.01)
-  gradient_accumulation_steps: 4                   # Effective batch size = 4 (AlphaGenome: 64)
+  gradient_accumulation_steps: 16                   # Effective batch size = 4 (AlphaGenome: 64)
   mixed_precision: "no"                          # Memory optimization
   
   # Gradient clipping for stability with AlphaGenome-style loss
@@ -64,7 +64,7 @@ data:
   seq_len: 98304                                   # Must match model.context_length
   
   # Data processing
-  window_overlap: 0.8                              # 10% overlap between windows
+  window_overlap: 0.95                              # 10% overlap between windows
   min_genes_per_window: 1                          # Minimum genes for valid window
   
   # AlphaGenome-style data augmentation (adapted for bacterial genomes)
