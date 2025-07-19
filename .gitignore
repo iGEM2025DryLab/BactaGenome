@@ -102,3 +102,9 @@ dmypy.json
 *.zarr
 
 inference_outputs/
+
+bactagenome/data/data/
+analyze_regulondb_data.py
+analyze_targets.py
+analyze_targets_quick.py
+regulondb_data_analysis.json
