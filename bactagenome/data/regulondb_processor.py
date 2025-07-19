@@ -146,18 +146,15 @@ class RegulonDBProcessor:
         Process real expression data from RegulonDB with proper normalization
         
         Returns:
-            Dictionary mapping gene IDs to expression dictionaries with normalized values
+            Dictionary mapping gene IDs to expression dictionaries with log-transformed values
         """
         logger.info("Processing gene expression data...")
         
         expr_file = self.regulondb_path / "regulondbht" / "geneExpression.bson"
         documents = self.load_bson_file(expr_file)
         
-        # Collect raw expression values
         raw_expression = defaultdict(list)
         all_tpm_values = []
-        all_fpkm_values = []
-        all_count_values = []
         
         count = 0
         for doc in tqdm(documents, desc="Processing expression"):
@@ -166,107 +163,44 @@ class RegulonDBProcessor:
                 
             gene_info = doc.get('gene', {})
             gene_id = gene_info.get('_id')
-            bnumber = gene_info.get('bnumber')
             
-            # Extract expression values if available
             tpm = doc.get('tpm')
-            fpkm = doc.get('fpkm') 
-            count_val = doc.get('count')
             
-            if gene_id and any([tpm, fpkm, count_val]):
+            if gene_id and tpm is not None:
                 expression_record = {
                     'gene_id': gene_id,
-                    'bnumber': bnumber,
                     'tpm': tpm,
-                    'fpkm': fpkm,
-                    'count': count_val,
                     'dataset_ids': doc.get('datasetIds', [])
                 }
-                
                 raw_expression[gene_id].append(expression_record)
-                
-                # Collect for normalization stats
-                if tpm is not None:
-                    all_tpm_values.append(tpm)
-                if fpkm is not None:
-                    all_fpkm_values.append(fpkm)
-                if count_val is not None:
-                    all_count_values.append(count_val)
+                all_tpm_values.append(tpm)
             
             count += 1
         
         logger.info(f"Found expression data for {len(raw_expression)} genes")
-        logger.info(f"Total TPM values: {len(all_tpm_values)}")
-        logger.info(f"Total FPKM values: {len(all_fpkm_values)}")
-        logger.info(f"Total count values: {len(all_count_values)}")
-        
-        # Compute normalization statistics (log-transform for very large values)
-        expression_stats = {
-            'tpm_log_mean': 0.0,
-            'tpm_log_std': 1.0,
-            'fpkm_log_mean': 0.0,
-            'fpkm_log_std': 1.0,
-            'count_log_mean': 0.0,
-            'count_log_std': 1.0
-        }
-        
-        if all_tpm_values:
-            log_tpm = np.log1p(all_tpm_values)  # log(1+x) for numerical stability
-            expression_stats['tpm_log_mean'] = np.mean(log_tpm)
-            expression_stats['tpm_log_std'] = np.std(log_tpm)
-            
-        if all_fpkm_values:
-            log_fpkm = np.log1p(all_fpkm_values)
-            expression_stats['fpkm_log_mean'] = np.mean(log_fpkm)
-            expression_stats['fpkm_log_std'] = np.std(log_fpkm)
-            
-        if all_count_values:
-            log_count = np.log1p(all_count_values)
-            expression_stats['count_log_mean'] = np.mean(log_count)
-            expression_stats['count_log_std'] = np.std(log_count)
-        
-        self.expression_stats = expression_stats
-        logger.info(f"Expression normalization stats: {expression_stats}")
-        
-        # Process and normalize expression data
+
+        # 【关键修改】: 只计算log1p转换，不再进行Z-score标准化
         processed_expression = {}
         for gene_id, expr_list in raw_expression.items():
-            # Average across multiple measurements for the same gene
             tpm_values = [e['tpm'] for e in expr_list if e['tpm'] is not None]
-            fpkm_values = [e['fpkm'] for e in expr_list if e['fpkm'] is not None]
-            count_values = [e['count'] for e in expr_list if e['count'] is not None]
+            
+            if not tpm_values:
+                continue
+
+            mean_tpm = np.mean(tpm_values)
+            log_tpm = np.log1p(mean_tpm) # 使用 log(1+x) 转换
             
             processed_record = {
-                'bnumber': expr_list[0]['bnumber'],
+                'bnumber': self.genes.get(gene_id, {}).get('bnumber'),
                 'num_measurements': len(expr_list),
-                'datasets': list(set().union(*[e['dataset_ids'] for e in expr_list]))
+                'tpm_raw': mean_tpm,
+                'tpm_log1p': log_tpm  # 新的目标值
             }
-            
-            # Compute mean and normalized values
-            if tpm_values:
-                mean_tpm = np.mean(tpm_values)
-                log_tpm = np.log1p(mean_tpm)
-                processed_record['tpm_raw'] = mean_tpm
-                processed_record['tpm_log'] = log_tpm
-                processed_record['tpm_normalized'] = (log_tpm - expression_stats['tpm_log_mean']) / expression_stats['tpm_log_std']
-                
-            if fpkm_values:
-                mean_fpkm = np.mean(fpkm_values)
-                log_fpkm = np.log1p(mean_fpkm)
-                processed_record['fpkm_raw'] = mean_fpkm
-                processed_record['fpkm_log'] = log_fpkm
-                processed_record['fpkm_normalized'] = (log_fpkm - expression_stats['fpkm_log_mean']) / expression_stats['fpkm_log_std']
-                
-            if count_values:
-                mean_count = np.mean(count_values)
-                log_count = np.log1p(mean_count)
-                processed_record['count_raw'] = mean_count
-                processed_record['count_log'] = log_count
-                processed_record['count_normalized'] = (log_count - expression_stats['count_log_mean']) / expression_stats['count_log_std']
             
             processed_expression[gene_id] = processed_record
         
         self.expression_data = processed_expression
+        logger.info(f"Processed expression data for {len(processed_expression)} genes using log1p transform.")
         return processed_expression
     
     def process_operon_data(self, max_docs: Optional[int] = None) -> Dict[str, Dict]:
@@ -424,10 +358,8 @@ class RegulonDBProcessor:
                     expression_value = 0.0
                     if 'expression' in gene and isinstance(gene['expression'], dict):
                         expr_data = gene['expression']
-                        if 'tpm_normalized' in expr_data:
-                            expression_value = expr_data['tpm_normalized']
-                        elif 'fpkm_normalized' in expr_data:
-                            expression_value = expr_data['fpkm_normalized']
+                        if 'tpm_log1p' in expr_data:
+                            expression_value = expr_data['tpm_log1p']
                     
                     # Assign expression value to gene region
                     targets['gene_expression'][window_idx, start_idx:end_idx, 0] = expression_value

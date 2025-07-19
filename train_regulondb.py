@@ -3,7 +3,7 @@ Training script for BactaGenome with real RegulonDB data
 """
 
 import os
-#os.environ["CUDA_VISIBLE_DEVICES"] = '5'  # Set visible devices to GPU 0
+#os.environ["CUDA_VISIBLE_DEVICES"] = '4'
 import platform
 import argparse
 import yaml
@@ -12,7 +12,7 @@ import numpy as np
 import logging
 import math
 from pathlib import Path
-from collections import defaultdict
+from datetime import datetime
 
 # MPS fallback for Apple Silicon
 if platform.system() == 'Darwin' and platform.machine() == 'arm64':
@@ -22,13 +22,13 @@ if platform.system() == 'Darwin' and platform.machine() == 'arm64':
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter # <-- 1. 导入 SummaryWriter
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
 
 from bactagenome import BactaGenome, BactaGenomeConfig
 from bactagenome.data import RegulonDBDataset, RegulonDBDataLoader, collate_regulondb_batch
 from bactagenome.training import BactaGenomeTrainer
-from bactagenome.model.losses import BacterialLossFunction
 from bactagenome.model.heads import RegulonDBLossFunction
 
 
@@ -184,6 +184,14 @@ def main():
     os.makedirs(config['training']['log_dir'], exist_ok=True)
     os.makedirs(args.processed_data_dir, exist_ok=True)
     
+    # <-- 2. 初始化 SummaryWriter
+    writer = None
+    if config['training'].get('use_tensorboard', False):
+        run_name = f"{Path(args.config).stem}_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        tensorboard_log_dir = Path(config['training']['log_dir']) / "tensorboard" / run_name
+        writer = SummaryWriter(log_dir=str(tensorboard_log_dir))
+        logger.info(f"TensorBoard logs will be saved to: {tensorboard_log_dir}")
+    
     # Determine data limits for testing
     max_docs = 1000 if args.test_mode else None
     
@@ -226,70 +234,67 @@ def main():
         model.parameters(),
         lr=float(config['training']['learning_rate']),
         weight_decay=float(config['training']['weight_decay']),
-        betas=(0.9, 0.999),  # AlphaGenome defaults
-        eps=1e-8             # AlphaGenome defaults
+        betas=(0.9, 0.999),
+        eps=1e-8
     )
     
-    # Create loss function with balanced weights for AlphaGenome-style losses
-    loss_weights = config['training'].get('loss_weights', {
-        'gene_expression': 1.0,    # Normal weight for AlphaGenome-style loss
-        'gene_density': 1.0,       # Normal weight for count data
-        'operon_membership': 1.0   # Normal weight for binary classification
-    })
+    # Create loss function
+    loss_function = RegulonDBLossFunction(
+        loss_weights=config['training'].get('loss_weights', {})
+    )
     
-    loss_function = RegulonDBLossFunction(loss_weights=loss_weights)
+    # Setup accelerator
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = Accelerator(
+        gradient_accumulation_steps=config['training'].get('gradient_accumulation_steps', 1),
+        mixed_precision=config['training'].get('mixed_precision', 'no'),
+        kwargs_handlers=[ddp_kwargs]
+    )
     
-    # Setup accelerator (optional - can run without accelerate launch)
-    try:
-        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-        accelerator = Accelerator(
-            gradient_accumulation_steps=config['training'].get('gradient_accumulation_steps', 1),
-            mixed_precision=config['training'].get('mixed_precision', 'no'),
-            log_with="wandb" if config['training'].get('use_wandb', False) else None,
-            kwargs_handlers=[ddp_kwargs]
-        )
-        logger.info("Using Accelerator for distributed training")
-    except Exception as e:
-        logger.warning(f"Accelerator initialization failed: {e}")
-        logger.info("Running without Accelerator (single GPU mode)")
-        accelerator = None
-    
-    # Create learning rate scheduler with warmup (AlphaGenome style)
-    def create_lr_scheduler(optimizer, config):
-        """Create AlphaGenome-style learning rate scheduler with warmup"""
+    # Create learning rate scheduler with warmup
+    def create_lr_scheduler(optimizer, config, dataloader):
+        """Create AlphaGenome-style learning rate scheduler with warmup and min_lr."""
         warmup_steps = config['training'].get('warmup_steps', 1000)
-        total_steps = config['training'].get('total_steps', 3000)
+        num_epochs = config['training']['epochs']
+        
+        # 【关键修改】: 动态计算 total_steps
+        # accelerator.num_processes 会给出分布式训练时的GPU数量
+        num_update_steps_per_epoch = math.ceil(len(dataloader) / accelerator.gradient_accumulation_steps)
+        total_steps = num_update_steps_per_epoch * num_epochs
+        
+        # 【新功能】: 添加一个最小学习率，防止学习完全停止
+        min_lr_ratio = 0.05 # 学习率最终衰减到峰值的 5%
+        peak_lr = optimizer.param_groups[0]['lr'] # 从optimizer获取峰值学习率
+        
+        logger.info(f"LR Scheduler: Warmup steps={warmup_steps}, Total steps={total_steps}, Peak LR={peak_lr:.2e}, Final LR ~={peak_lr*min_lr_ratio:.2e}")
         
         def lr_lambda(current_step):
             if current_step < warmup_steps:
-                # Linear warmup from 0 to peak learning rate
+                # 线性 warmup
                 return float(current_step) / float(max(1, warmup_steps))
-            else:
-                # Cosine decay from peak to 0
-                progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-                return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+            
+            # 【关键修改】: 改进的 Cosine Decay
+            # 确保我们不会衰减到0，而是一个最小学习率
+            progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+            
+            # Cosine 衰减从 1 到 min_lr_ratio
+            cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+            decayed_ratio = (1 - min_lr_ratio) * cosine_decay + min_lr_ratio
+            
+            return max(0.0, decayed_ratio)
         
         return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    # Prepare for distributed training
+    model, optimizer, train_loader, val_loader = accelerator.prepare(
+        model, optimizer, train_loader, val_loader
+    )
     
-    # Create scheduler
-    scheduler = create_lr_scheduler(optimizer, config) if config['training'].get('scheduler') == 'cosine_with_warmup' else None
-    
-    # Prepare for distributed training (if accelerator available)
-    if accelerator is not None:
-        model, optimizer, train_loader, val_loader = accelerator.prepare(
-            model, optimizer, train_loader, val_loader
-        )
+    scheduler = create_lr_scheduler(optimizer, config, train_loader) if config['training'].get('scheduler') == 'cosine_with_warmup' else None
+    if scheduler:
+        scheduler = accelerator.prepare(scheduler)
         
-        # Prepare scheduler after accelerator.prepare
-        if scheduler is not None:
-            scheduler = accelerator.prepare(scheduler)
-        
-        device = accelerator.device
-    else:
-        # Manual device setup
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        model = model.to(device)
-        logger.info(f"Using device: {device}")
+    device = accelerator.device
     
     # Create trainer
     trainer = BactaGenomeTrainer(
@@ -323,7 +328,6 @@ def main():
         logger.info(f"=== EPOCH {epoch + 1} TRAINING LOSSES ===")
         logger.info(f"🔢 Total Loss: {train_metrics['total_loss']:.6f}")
         
-        # Log individual modality losses with clear formatting
         modality_losses = {k: v for k, v in train_metrics.items() if k not in ['total_loss', 'samples_processed']}
         if modality_losses:
             logger.info("📊 Individual Modality Losses:")
@@ -335,13 +339,21 @@ def main():
         logger.info(f"👥 Samples processed: {train_metrics.get('samples_processed', 'unknown')}")
         logger.info("=" * 40)
         
+        # <-- 3. 将训练指标写入 TensorBoard
+        if writer and accelerator.is_main_process:
+            writer.add_scalar('Loss/train_total', train_metrics['total_loss'], epoch + 1)
+            for modality, loss_val in modality_losses.items():
+                writer.add_scalar(f'Loss/train_{modality}', loss_val, epoch + 1)
+            
+            current_lr = trainer.optimizer.param_groups[0]['lr']
+            writer.add_scalar('Learning_Rate', current_lr, epoch + 1)
+
         # Validation
         if (epoch + 1) % config['training'].get('val_interval', 5) == 0:
             val_metrics = trainer.validate_epoch(val_loader)
             logger.info(f"=== EPOCH {epoch + 1} VALIDATION LOSSES ===")
             logger.info(f"🔢 Total Validation Loss: {val_metrics['total_loss']:.6f}")
             
-            # Log individual modality losses
             val_modality_losses = {k: v for k, v in val_metrics.items() if k not in ['total_loss', 'samples_processed']}
             if val_modality_losses:
                 logger.info("📊 Individual Validation Modality Losses:")
@@ -353,6 +365,12 @@ def main():
             logger.info(f"👥 Validation samples processed: {val_metrics.get('samples_processed', 'unknown')}")
             logger.info("=" * 40)
             
+            # <-- 4. 将验证指标写入 TensorBoard
+            if writer and accelerator.is_main_process:
+                writer.add_scalar('Loss/validation_total', val_metrics['total_loss'], epoch + 1)
+                for modality, loss_val in val_modality_losses.items():
+                    writer.add_scalar(f'Loss/validation_{modality}', loss_val, epoch + 1)
+
             # Save best model
             if val_metrics['total_loss'] < best_val_loss:
                 best_val_loss = val_metrics['total_loss']
@@ -375,6 +393,11 @@ def main():
     final_model_path = os.path.join(config['training']['checkpoint_dir'], 'final_model_regulondb.pt')
     trainer.save_checkpoint(final_model_path, config['training']['epochs'])
     logger.info(f"Final model saved: {final_model_path}")
+    
+    # <-- 5. 训练结束后关闭 writer
+    if writer and accelerator.is_main_process:
+        writer.close()
+        logger.info("TensorBoard writer closed.")
     
     logger.info("RegulonDB training completed!")
 

@@ -21,11 +21,11 @@ training:
   epochs: 681                                        # More epochs for real data
   # AlphaGenome uses batch_size: 64, but smaller here due to memory constraints
   batch_size: 2                                    # Smaller batch due to large sequences
-  learning_rate: 0.0005                            # AlphaGenome peak learning rate (was 1e-4)
+  learning_rate: 0.001                            # AlphaGenome peak learning rate (was 1e-4)
   # AlphaGenome uses weight_decay: 0.4, but we use smaller due to limited data
-  weight_decay: 0.1                               # L2 regularization (increased from 0.01)
+  weight_decay: 0.05                               # L2 regularization (increased from 0.01)
   gradient_accumulation_steps: 8                   # Effective batch size = 4 (AlphaGenome: 64)
-  mixed_precision: "no"                          # Memory optimization
+  mixed_precision: "bf16"                          # Memory optimization
   
   # Gradient clipping for stability with AlphaGenome-style loss
   max_grad_norm: 1.0                              # Clip gradients to prevent explosion
@@ -44,9 +44,9 @@ training:
   
   # Optimization - AlphaGenome style
   # AlphaGenome uses 5,000 warmup steps out of 15,000 total
-  warmup_steps: 5000                               # Warmup schedule (increased from 500)
-  scheduler: "cosine_with_warmup"                  # Learning rate schedule with warmup
-  total_steps: 15000                                # Total training steps (for LR schedule)
+  warmup_steps: 10000                              # 适当增加warmup步数
+  scheduler: "cosine_with_warmup"
+  # total_steps: 340500                              # 根据你的数据集大小和epoch计算总步数
   
   # Hardware and performance
   num_workers: 2                                   # Data loading workers
@@ -65,9 +65,9 @@ data:
   seq_len: 98304                                   # Must match model.context_length
   
   # Data processing
-  window_overlap: 0.8                              # 10% overlap between windows
+  window_overlap: 0.1                              # 10% overlap between windows
   min_genes_per_window: 1                          # Minimum genes for valid window
-  
+
   # AlphaGenome-style data augmentation (adapted for bacterial genomes)
   augmentation:
     enable: true                                   # Enable data augmentation for training

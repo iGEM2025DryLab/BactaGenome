@@ -559,113 +559,61 @@ class RegulonDBHeadManager(nn.ModuleDict):
 
 class RegulonDBLossFunction(nn.Module):
     """
-    Loss function for RegulonDB-based bacterial genomics targets
-    Uses AlphaGenome-inspired loss functions for better training
+    Loss function for RegulonDB-based bacterial genomics targets.
+    This version is adapted for pre-processed, non-negative targets.
     """
     
-    def __init__(self, loss_weights: dict = None, use_alphgenome_loss: bool = True):
+    def __init__(self, loss_weights: dict = None):
         super().__init__()
         
-        # Default weights for each target
         self.loss_weights = loss_weights or {
             'gene_expression': 1.0,
             'gene_density': 1.0, 
             'operon_membership': 1.0
         }
         
-        self.use_alphgenome_loss = use_alphgenome_loss
-        
-        # Standard loss functions as fallback
+        # 使用MSE来比较log(1+TPM)的预测值和目标值，这是一个稳定且有效的选择
         self.mse_loss = nn.MSELoss()
+        
+        # 使用Poisson NLL Loss来处理计数值（如基因密度），更符合其统计特性
+        # log_input=False因为模型输出的是期望值（lambda），而不是log(lambda)
+        self.poisson_loss = nn.PoissonNLLLoss(log_input=False)
+
+        # 使用BCE Loss处理二分类问题（如操纵子成员）
         self.bce_loss = nn.BCELoss()
     
     def forward(self, predictions: dict, targets: dict, organism_name: str) -> tuple:
-        """
-        Compute losses for all targets
-        
-        Args:
-            predictions: Dict of model predictions
-            targets: Dict of target tensors
-            organism_name: Name of organism (for compatibility)
-            
-        Returns:
-            Tuple of (total_loss, individual_losses_dict)
-        """
         individual_losses = {}
         total_loss = 0.0
         
-        # Gene expression loss - use MSE for normalized expression data
+        # 1. Gene expression loss (MSE on log-transformed data)
         if 'gene_expression' in predictions and 'gene_expression' in targets:
             pred = predictions['gene_expression']
             target = targets['gene_expression']
             
-            # Ensure compatible shapes
-            if pred.shape != target.shape:
-                logging.warning('Prediction and target tensors for "gene expression" have different shapes')
-                min_len = min(pred.shape[1], target.shape[1])
-                pred = pred[:, :min_len]
-                target = target[:, :min_len]
-            
-            # Use MSE loss for normalized expression data
-            # AlphaGenome multinomial+Poisson loss is designed for raw count data,
-            # but RegulonDB expression data is pre-normalized (log-transformed, z-scored)
-            
-            # Debug: Check prediction and target ranges
-            if logging.getLogger().isEnabledFor(logging.DEBUG):
-                logging.debug(f"Gene expression - Pred range: [{pred.min():.3f}, {pred.max():.3f}], Target range: [{target.min():.3f}, {target.max():.3f}]")
-            
             loss = self.mse_loss(pred, target)
-            
             individual_losses['gene_expression'] = loss.item()
-            total_loss += self.loss_weights['gene_expression'] * loss
-        
-        # Gene density loss - AlphaGenome-style for count data
+            total_loss += self.loss_weights.get('gene_expression', 1.0) * loss
+
+        # 2. Gene density loss (Poisson for count data)
         if 'gene_density' in predictions and 'gene_density' in targets:
             pred = predictions['gene_density']
             target = targets['gene_density']
-            
-            # Ensure compatible shapes
-            if pred.shape != target.shape:
-                logging.warning('Prediction and target tensors for "gene density" have different shapes')
-                min_len = min(pred.shape[1], target.shape[1])
-                pred = pred[:, :min_len]
-                target = target[:, :min_len]
-            
-            # Use MSE loss for gene density as well (safer for initial training)
-            # Gene density has small integer values (0-4), but MSE is more stable
-            # than multinomial+Poisson loss during early training
-            
-            # Debug: Check prediction and target ranges
-            if logging.getLogger().isEnabledFor(logging.DEBUG):
-                logging.debug(f"Gene density - Pred range: [{pred.min():.3f}, {pred.max():.3f}], Target range: [{target.min():.3f}, {target.max():.3f}]")
-            
-            loss = self.mse_loss(pred, target)
-            
-            # TODO: Consider switching to multinomial+Poisson loss after stable training
-            # track_means = torch.tensor([1.08]).to(target.device)
-            # scaled_targets = targets_scaling(target, track_means, apply_squashing=False)
-            # resolution = min(pred.shape[1] // 8, 128)
-            # loss = multinomial_poisson_loss(pred, scaled_targets, multinomial_resolution=resolution)
-            
+
+            loss = self.poisson_loss(pred, target)
+            # 或者，继续使用MSE也可以作为一个更简单的起点: loss = self.mse_loss(pred, target)
+
             individual_losses['gene_density'] = loss.item()
-            total_loss += self.loss_weights['gene_density'] * loss
-        
-        # Operon membership loss (BCE for binary classification)
+            total_loss += self.loss_weights.get('gene_density', 1.0) * loss
+
+        # 3. Operon membership loss (BCE for binary classification)
         if 'operon_membership' in predictions and 'operon_membership' in targets:
             pred = predictions['operon_membership']
             target = targets['operon_membership']
-            
-            # Ensure compatible shapes
-            if pred.shape != target.shape:
-                logging.warning('Prediction and target tensors for "operon membership" have different shapes')
-                min_len = min(pred.shape[1], target.shape[1])
-                pred = pred[:, :min_len]
-                target = target[:, :min_len]
-            
-            # Use BCE loss for binary classification
+
             loss = self.bce_loss(pred, target)
             individual_losses['operon_membership'] = loss.item()
-            total_loss += self.loss_weights['operon_membership'] * loss
+            total_loss += self.loss_weights.get('operon_membership', 1.0) * loss
         
         return total_loss, individual_losses
 
