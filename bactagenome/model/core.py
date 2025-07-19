@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Dict, Any, Tuple
+from torch.utils.checkpoint import checkpoint
 
 # Import AlphaGenome components
 from ..model.components import (
@@ -207,10 +208,23 @@ class BactaGenome(nn.Module):
         """Get embeddings at different resolutions"""
         organism_embed = self.organism_embed(organism_index)
         
-        # Forward through transformer-unet
-        unet_out, single, pairwise = self.transformer_unet(
-            seq, pre_attend_embed=organism_embed
-        )
+        # 定义一个可以被 checkpoint 包装的函数
+        def custom_forward(x, pre_attend_embed):
+            return self.transformer_unet(x, pre_attend_embed=pre_attend_embed)
+
+        # 在训练时使用梯度检查点
+        if self.training and seq.requires_grad:
+            unet_out, single, pairwise = checkpoint(
+                custom_forward, 
+                seq, 
+                organism_embed, 
+                use_reentrant=False # PyTorch 推荐的新用法
+            )
+        else:
+            # 在推理时不使用，以加快速度
+            unet_out, single, pairwise = self.transformer_unet(
+                seq, pre_attend_embed=organism_embed
+            )
         
         # Organism-specific output embeddings
         embeds_128bp = self.outembed_128bp(single, organism_index)

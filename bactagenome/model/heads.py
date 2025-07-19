@@ -18,7 +18,7 @@ def tracks_scaled_predictions(embeddings: torch.Tensor, head: nn.Module, scale_p
     """
     x = head(embeddings)  # Linear projection
     return F.softplus(x) * F.softplus(scale_param)
-    # return F.mish(x) * F.mish(scale_param)
+    #return F.mish(x) * F.mish(scale_param)
 
 
 def nonzero_mean(tensor):
@@ -642,11 +642,10 @@ class RegulonDBLossFunction(nn.Module):
             loss = self.mse_loss(pred, target)
             
             # TODO: Consider switching to multinomial+Poisson loss after stable training
-            # if self.use_alphgenome_loss and len(pred.shape) == 3 and pred.shape[1] >= 64:
-            #     track_means = torch.tensor([1.08]).to(target.device)
-            #     scaled_targets = targets_scaling(target, track_means, apply_squashing=False)
-            #     resolution = min(pred.shape[1] // 8, 128)
-            #     loss = multinomial_poisson_loss(pred, scaled_targets, multinomial_resolution=resolution)
+            # track_means = torch.tensor([1.08]).to(target.device)
+            # scaled_targets = targets_scaling(target, track_means, apply_squashing=False)
+            # resolution = min(pred.shape[1] // 8, 128)
+            # loss = multinomial_poisson_loss(pred, scaled_targets, multinomial_resolution=resolution)
             
             individual_losses['gene_density'] = loss.item()
             total_loss += self.loss_weights['gene_density'] * loss

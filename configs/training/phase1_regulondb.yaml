@@ -24,7 +24,7 @@ training:
   learning_rate: 0.0005                            # AlphaGenome peak learning rate (was 1e-4)
   # AlphaGenome uses weight_decay: 0.4, but we use smaller due to limited data
   weight_decay: 0.1                               # L2 regularization (increased from 0.01)
-  gradient_accumulation_steps: 4                   # Effective batch size = 4 (AlphaGenome: 64)
+  gradient_accumulation_steps: 8                   # Effective batch size = 4 (AlphaGenome: 64)
   mixed_precision: "no"                          # Memory optimization
   
   # Gradient clipping for stability with AlphaGenome-style loss
@@ -51,6 +51,7 @@ training:
   # Hardware and performance
   num_workers: 2                                   # Data loading workers
   use_wandb: false                                 # Weights & Biases logging
+  use_tensorboard: true                         # TensorBoard logging for training metrics
   
   # Directories
   checkpoint_dir: "checkpoints/phase1_regulondb"
